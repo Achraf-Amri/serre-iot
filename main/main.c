@@ -6,12 +6,17 @@
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_adc/adc_oneshot.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "cJSON.h"
+#include "net.h"
 
 #define I2C_SDA      GPIO_NUM_21
 #define I2C_SCL      GPIO_NUM_22
@@ -228,6 +233,11 @@ static int   status_ticks   = 0;
 
 static void nvs_load_cal(void)
 {
+    /* Valeurs par defaut (mesures du groupe) : utilisees si la NVS est vide,
+       ce qui est le cas a chaque lancement en simulation Wokwi. */
+    adc_sec = 3170;
+    adc_humide = 668;
+
     nvs_handle_t h;
     if (nvs_open("cal", NVS_READONLY, &h) == ESP_OK) {
         int32_t v;
@@ -290,10 +300,184 @@ static void calibrate(bool dry)
     set_status(dry ? "CAL SEC OK" : "CAL HUM OK");
 }
 
-/* ==============================  MAIN  ================================= */
+/* ===============  ETAT APPLIQUE, COMMANDES, ALERTES, PUBLICATIONS  ============== */
 
-void app_main(void)
+#define LED_PUMP    GPIO_NUM_26     // LED verte : pompe d'arrosage simulee
+#define LED_VENT    GPIO_NUM_27     // LED jaune : ventilation simulee
+#define SOIL_HYST   10.0f           // pompe OFF quand indice >= seuil + 10
+#define TEMP_HYST   2.0f            // ventilation OFF quand T <= seuil - 2
+
+typedef struct {
+    bool  manual;      // false = AUTO, true = MANUEL
+    bool  pump;        // etat reellement applique a la LED verte
+    bool  vent;        // etat reellement applique a la LED jaune
+    float soil_thr;    // seuil de sol sec (%)
+    float temp_thr;    // seuil de temperature (C)
+    int   period_s;    // periode de publication de la telemetrie (s)
+} app_state_t;
+
+static app_state_t st = { .manual = false, .pump = false, .vent = false,
+                          .soil_thr = 30, .temp_thr = 30, .period_s = 5 };
+static SemaphoreHandle_t st_mx;
+static volatile bool state_dirty = true;   // /state a (re)publier
+
+typedef struct { char type[24]; char cause[80]; char state[10]; } alert_t;
+static QueueHandle_t alert_q;
+
+static void push_alert(const char *type, const char *cause, const char *state)
 {
+    alert_t a;
+    snprintf(a.type, sizeof(a.type), "%s", type);
+    snprintf(a.cause, sizeof(a.cause), "%s", cause);
+    snprintf(a.state, sizeof(a.state), "%s", state);
+    xQueueSend(alert_q, &a, 0);
+}
+
+static void reject(const char *type, const char *cause)
+{
+    ESP_LOGW(TAG, "%s : %s", type, cause);
+    push_alert(type, cause, "active");
+}
+
+/* Appelee par le client MQTT pour /cmd et /config/set : valide, applique, confirme. */
+static void on_rx(const char *suffix, const char *data, int len)
+{
+    (void)len;
+    bool is_cmd = (strcmp(suffix, "/cmd") == 0);
+    bool is_cfg = (strcmp(suffix, "/config/set") == 0);
+    if (!is_cmd && !is_cfg) return;
+
+    const char *rej = is_cmd ? "cmd_rejected" : "config_rejected";
+    cJSON *root = cJSON_Parse(data);
+    if (!cJSON_IsObject(root)) {
+        reject(rej, "message non JSON");
+        state_dirty = true;
+        cJSON_Delete(root);
+        return;
+    }
+
+    xSemaphoreTake(st_mx, portMAX_DELAY);
+    app_state_t n = st;
+    const char *err = NULL;
+
+    if (is_cmd) {
+        cJSON *m = cJSON_GetObjectItemCaseSensitive(root, "mode");
+        cJSON *p = cJSON_GetObjectItemCaseSensitive(root, "pump");
+        cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "vent");
+        if (m) {
+            if (cJSON_IsString(m) && m->valuestring && strcmp(m->valuestring, "AUTO") == 0) {
+                n.manual = false; n.pump = false; n.vent = false;
+            } else if (cJSON_IsString(m) && m->valuestring && strcmp(m->valuestring, "MANUEL") == 0) {
+                n.manual = true;
+            } else {
+                err = "mode invalide";
+            }
+        }
+        if (!err && (p || v)) {
+            if (!n.manual) {
+                err = "commande LED refusee en mode AUTO";
+            } else {
+                if (p) { if (cJSON_IsBool(p)) n.pump = cJSON_IsTrue(p); else err = "pump doit etre booleen"; }
+                if (!err && v) { if (cJSON_IsBool(v)) n.vent = cJSON_IsTrue(v); else err = "vent doit etre booleen"; }
+            }
+        }
+    } else {
+        cJSON *a = cJSON_GetObjectItemCaseSensitive(root, "soil_dry_threshold");
+        cJSON *b = cJSON_GetObjectItemCaseSensitive(root, "temp_threshold");
+        cJSON *c = cJSON_GetObjectItemCaseSensitive(root, "publish_period_s");
+        if (a) {
+            if (cJSON_IsNumber(a) && a->valuedouble >= 0 && a->valuedouble <= 100) n.soil_thr = (float)a->valuedouble;
+            else err = "soil_dry_threshold hors plage (0..100)";
+        }
+        if (!err && b) {
+            if (cJSON_IsNumber(b) && b->valuedouble >= 0 && b->valuedouble <= 80) n.temp_thr = (float)b->valuedouble;
+            else err = "temp_threshold hors plage (0..80)";
+        }
+        if (!err && c) {
+            if (cJSON_IsNumber(c) && c->valuedouble >= 1 && c->valuedouble <= 3600) n.period_s = (int)c->valuedouble;
+            else err = "publish_period_s hors plage (1..3600)";
+        }
+    }
+
+    if (!err) st = n;                  // rien n'est applique si une seule valeur est refusee
+    xSemaphoreGive(st_mx);
+
+    if (err) reject(rej, err);
+    state_dirty = true;                // dans tous les cas, /state confirme l'etat reel
+    cJSON_Delete(root);
+}
+
+static void publish_state(void)
+{
+    state_dirty = false;
+    app_state_t s;
+    xSemaphoreTake(st_mx, portMAX_DELAY);
+    s = st;
+    xSemaphoreGive(st_mx);
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"ts\":%lld,\"mode\":\"%s\",\"pump\":%s,\"vent\":%s,"
+        "\"params\":{\"soil_dry_threshold\":%g,\"temp_threshold\":%g,\"publish_period_s\":%d}}",
+        net_epoch(), s.manual ? "MANUEL" : "AUTO",
+        s.pump ? "true" : "false", s.vent ? "true" : "false",
+        s.soil_thr, s.temp_thr, s.period_s);
+    if (net_publish("/state", buf, 1, true) < 0) state_dirty = true;   // on reessaiera
+}
+
+static void publish_telemetry(bool bv, float t, float p, bool iv, float idx, float adc)
+{
+    static uint32_t seq = 0;
+    char ts_[16], ps_[16], is_[16], buf[384];
+
+    if (bv) {
+        snprintf(ts_, sizeof(ts_), "%.1f", t);
+        snprintf(ps_, sizeof(ps_), "%.1f", p);
+    } else {
+        strcpy(ts_, "null");
+        strcpy(ps_, "null");
+    }
+    if (iv) snprintf(is_, sizeof(is_), "%.0f", idx);
+    else    strcpy(is_, "null");
+
+    seq++;
+    snprintf(buf, sizeof(buf),
+        "{\"seq\":%lu,\"ts\":%lld,\"uptime_s\":%lld,"
+        "\"temperature\":{\"value\":%s,\"unit\":\"\xC2\xB0" "C\",\"valid\":%s},"
+        "\"pressure\":{\"value\":%s,\"unit\":\"hPa\",\"valid\":%s},"
+        "\"soil_index\":{\"value\":%s,\"unit\":\"%%\",\"valid\":%s,\"adc\":%.0f}}",
+        (unsigned long)seq, net_epoch(), (long long)(esp_timer_get_time() / 1000000),
+        ts_, bv ? "true" : "false",
+        ps_, bv ? "true" : "false",
+        is_, iv ? "true" : "false", adc);
+    net_publish("/telemetry", buf, 0, false);
+}
+
+static int publish_alert(const alert_t *a)
+{
+    char buf[220];
+    snprintf(buf, sizeof(buf),
+        "{\"ts\":%lld,\"type\":\"%s\",\"cause\":\"%s\",\"state\":\"%s\"}",
+        net_epoch(), a->type, a->cause, a->state);
+    return net_publish("/alerts", buf, 1, false);
+}
+
+/* ==============================  TACHE PRINCIPALE  ======================== */
+
+static void app_task(void *arg)
+{
+    st_mx   = xSemaphoreCreateMutex();
+    alert_q = xQueueCreate(8, sizeof(alert_t));
+
+    /* LED : eteintes au demarrage, jusqu'aux premieres mesures valides */
+    gpio_config_t led_cfg = {
+        .pin_bit_mask = (1ULL << LED_PUMP) | (1ULL << LED_VENT),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&led_cfg);
+    gpio_set_level(LED_PUMP, 0);
+    gpio_set_level(LED_VENT, 0);
+
     /* NVS (stockage de la calibration) */
     esp_err_t nerr = nvs_flash_init();
     if (nerr == ESP_ERR_NVS_NO_FREE_PAGES || nerr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -302,6 +486,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nerr);
     nvs_load_cal();
+
+    /* Wi-Fi + MQTT (apres la NVS) */
+    net_set_rx_cb(on_rx);
+    net_start();
 
     /* Boutons de calibration (actifs a l'etat bas) */
     gpio_config_t btn_cfg = {
@@ -355,11 +543,18 @@ void app_main(void)
     ESP_LOGI(TAG, "Calibration chargee : sec=%d humide=%d (%s)",
              adc_sec, adc_humide, cal_valid() ? "valide" : "ABSENTE");
 
-    char  line[32];
+    char  line[40];
     float t_last = 0, p_last = 0;
     bool  have_last = false;
     int   bmp_fail = 0;
     int   tick = 0;
+    int   tel_ms = 0;
+    bool  have_meas = false;
+    float cur_idx = 0;
+    bool  cur_idx_valid = false, cur_bmp_valid = false;
+    bool  soil_cond = false, temp_cond = false;            // conditions avec hysteresis
+    bool  soil_cond_prev = false, temp_cond_prev = false;  // pour detecter les changements
+    bool  soil_inv_prev = false, bmp_inv_prev = false;
 
     while (1) {
         /* ---- Acquisition du sol toutes les 100 ms ---- */
@@ -381,7 +576,7 @@ void app_main(void)
 
         if (status_ticks > 0) status_ticks--;
 
-        /* ---- Affichage + logs une fois par seconde ---- */
+        /* ---- Mesures, decisions locales, affichage : une fois par seconde ---- */
         if (++tick >= 10) {
             tick = 0;
 
@@ -404,8 +599,78 @@ void app_main(void)
                 if (idx < 0.0f)   idx = 0.0f;
                 if (idx > 100.0f) idx = 100.0f;
             }
+            cur_idx = idx;
+            cur_idx_valid = idx_valid;
+            cur_bmp_valid = bmp_valid;
+            have_meas = true;
+
+            app_state_t s0;
+            xSemaphoreTake(st_mx, portMAX_DELAY);
+            s0 = st;
+            xSemaphoreGive(st_mx);
+
+            /* Conditions avec hysteresis (evaluees dans tous les modes) */
+            if (idx_valid) {
+                float off = s0.soil_thr + SOIL_HYST;
+                if (off > 100.0f) off = 100.0f;
+                if (idx < s0.soil_thr)  soil_cond = true;
+                else if (idx >= off)    soil_cond = false;
+            }
+            if (bmp_valid) {
+                if (t_last > s0.temp_thr)                 temp_cond = true;
+                else if (t_last <= s0.temp_thr - TEMP_HYST) temp_cond = false;
+            }
+
+            /* Alertes : apparition et retour a la normale */
+            char cause[80];
+            if (soil_cond != soil_cond_prev) {
+                soil_cond_prev = soil_cond;
+                if (soil_cond) snprintf(cause, sizeof(cause), "indice sol %.0f %% < seuil %.0f %%", idx, s0.soil_thr);
+                else           snprintf(cause, sizeof(cause), "indice sol %.0f %% revenu a la normale", idx);
+                push_alert("soil_dry", cause, soil_cond ? "active" : "cleared");
+            }
+            if (temp_cond != temp_cond_prev) {
+                temp_cond_prev = temp_cond;
+                if (temp_cond) snprintf(cause, sizeof(cause), "temperature %.1f C > seuil %.0f C", t_last, s0.temp_thr);
+                else           snprintf(cause, sizeof(cause), "temperature %.1f C revenue a la normale", t_last);
+                push_alert("temp_high", cause, temp_cond ? "active" : "cleared");
+            }
+            if ((!soil_valid) != soil_inv_prev) {
+                soil_inv_prev = !soil_valid;
+                push_alert("sensor_soil",
+                           soil_inv_prev ? "lecture ADC sol invalide" : "lecture ADC sol revenue valide",
+                           soil_inv_prev ? "active" : "cleared");
+            }
+            if ((!bmp_valid) != bmp_inv_prev) {
+                bmp_inv_prev = !bmp_valid;
+                push_alert("sensor_bmp",
+                           bmp_inv_prev ? "lecture BMP180 invalide" : "lecture BMP180 revenue valide",
+                           bmp_inv_prev ? "active" : "cleared");
+            }
+
+            /* Mode AUTO : les LED suivent les conditions ; mesure invalide = LED eteinte */
+            if (!s0.manual) {
+                bool np = idx_valid && soil_cond;
+                bool nv = bmp_valid && temp_cond;
+                xSemaphoreTake(st_mx, portMAX_DELAY);
+                if (!st.manual && (st.pump != np || st.vent != nv)) {
+                    st.pump = np;
+                    st.vent = nv;
+                    state_dirty = true;
+                }
+                xSemaphoreGive(st_mx);
+            }
+
+            app_state_t s1;
+            xSemaphoreTake(st_mx, portMAX_DELAY);
+            s1 = st;
+            xSemaphoreGive(st_mx);
 
             /* OLED */
+            snprintf(line, sizeof(line), "%s P:%s V:%s",
+                     s1.manual ? "MANUEL" : "AUTO", s1.pump ? "ON" : "OFF", s1.vent ? "ON" : "OFF");
+            oled_text(1, line);
+
             if (bmp_valid) {
                 snprintf(line, sizeof(line), "T: %.1f C", t_last);
                 oled_text(2, line);
@@ -425,23 +690,59 @@ void app_main(void)
             }
             oled_text(4, line);
             oled_text(5, status_ticks > 0 ? status_msg : "");
-            oled_text(6, "WIFI: --  MQTT: --");
+            snprintf(line, sizeof(line), "WIFI:%s MQTT:%s",
+                     net_wifi_ok() ? "OK" : "--", net_mqtt_ok() ? "OK" : "--");
+            oled_text(6, line);
             oled_flush();
 
-            /* Terminal */
-            ESP_LOGI(TAG, "T=%s | P=%s | ADC brut=%d filtre=%.0f | idx=%s | cal sec=%d hum=%d",
-                     bmp_valid ? "ok" : "INVALIDE",
-                     bmp_valid ? "ok" : "INVALIDE",
-                     avg, soil_f < 0 ? 0.0f : soil_f,
-                     idx_valid ? "ok" : "INVALIDE", adc_sec, adc_humide);
-            if (bmp_valid) {
-                ESP_LOGI(TAG, "   -> %.1f C, %.1f hPa", t_last, p_last);
+            /* Terminal : une ligne par seconde */
+            char tl[12], pl[12], il[12];
+            if (bmp_valid) { snprintf(tl, sizeof(tl), "%.1f", t_last); snprintf(pl, sizeof(pl), "%.1f", p_last); }
+            else           { strcpy(tl, "---"); strcpy(pl, "---"); }
+            if (idx_valid) snprintf(il, sizeof(il), "%.0f", idx); else strcpy(il, "---");
+            ESP_LOGI(TAG, "T=%s C P=%s hPa | sol=%s %% (ADC %.0f) | %s pompe=%d vent=%d | wifi=%d mqtt=%d",
+                     tl, pl, il, soil_f < 0 ? 0.0f : soil_f,
+                     s1.manual ? "MANUEL" : "AUTO", s1.pump, s1.vent,
+                     net_wifi_ok(), net_mqtt_ok());
+        }
+
+        /* ---- LED : appliquent l'etat courant (commande MANUEL immediate) ---- */
+        bool lp, lv;
+        xSemaphoreTake(st_mx, portMAX_DELAY);
+        lp = st.pump;
+        lv = st.vent;
+        int period_s = st.period_s;
+        xSemaphoreGive(st_mx);
+        gpio_set_level(LED_PUMP, lp);
+        gpio_set_level(LED_VENT, lv);
+
+        /* ---- Publications ---- */
+        if (net_take_new_connection()) state_dirty = true;   // resynchroniser apres (re)connexion
+
+        if (net_mqtt_ok()) {
+            if (state_dirty) publish_state();
+
+            alert_t a;
+            while (xQueueReceive(alert_q, &a, 0) == pdTRUE) {
+                if (publish_alert(&a) < 0) {                 // echec : on garde l'alerte
+                    xQueueSendToFront(alert_q, &a, 0);
+                    break;
+                }
             }
-            if (idx_valid) {
-                ESP_LOGI(TAG, "   -> indice sol = %.0f %%", idx);
+
+            tel_ms += 100;
+            if (have_meas && tel_ms >= period_s * 1000) {
+                tel_ms = 0;
+                publish_telemetry(cur_bmp_valid, t_last, p_last, cur_idx_valid, cur_idx,
+                                  soil_f < 0 ? 0.0f : soil_f);
             }
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+}
+
+void app_main(void)
+{
+    xTaskCreate(app_task, "app", 8192, NULL, 5, NULL);
 }
